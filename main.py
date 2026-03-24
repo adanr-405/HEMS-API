@@ -69,6 +69,14 @@ def parse_relay_bool(extra: Dict[str, Any], relay_key: str, fallback_key: str) -
     return False
 
 
+def default_relays() -> Dict[str, bool]:
+    return {
+        "relay_1": False,
+        "relay_2": False,
+        "relay_3": False,
+    }
+
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "time": int(time.time())}
@@ -88,6 +96,7 @@ def post_telemetry(payload: TelemetryIn, authorization: Optional[str] = Header(N
         "relay_2": parse_relay_bool(extra, "relay_2", "l2"),
         "relay_3": parse_relay_bool(extra, "relay_3", "l3"),
     }
+    st["relay_source"] = "telemetry"
 
     latest_state[payload.device_id] = st
     return {"ok": True}
@@ -102,11 +111,8 @@ def get_state(device_id: str, authorization: Optional[str] = Header(None)):
         return {
             "device_id": device_id,
             "online": False,
-            "relays": {
-                "relay_1": False,
-                "relay_2": False,
-                "relay_3": False,
-            },
+            "relays": default_relays(),
+            "relay_source": "default",
         }
 
     last_seen = st.get("last_seen", 0)
@@ -131,6 +137,15 @@ def post_command(cmd: CommandIn, authorization: Optional[str] = Header(None)):
             raise HTTPException(status_code=400, detail="relay must be 1, 2, or 3")
         if state not in [0, 1]:
             raise HTTPException(status_code=400, detail="state must be 0 or 1")
+
+        # Immediately update remembered relay state so the app reflects
+        # the last commanded state even before telemetry arrives.
+        st = latest_state.get(cmd.device_id, {})
+        st.setdefault("relays", default_relays())
+        st["relays"][f"relay_{relay}"] = (state == 1)
+        st["last_seen"] = int(time.time())
+        st["relay_source"] = "command"
+        latest_state[cmd.device_id] = st
 
     cmd_id = f"{int(time.time() * 1000)}_{cmd.device_id}"
     entry = {
