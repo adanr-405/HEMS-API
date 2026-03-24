@@ -1,6 +1,7 @@
 import os
 import time
 from typing import Optional, Dict, Any, List
+
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
@@ -48,6 +49,26 @@ latest_state: Dict[str, Any] = {}
 pending_commands: Dict[str, List[Dict[str, Any]]] = {}
 
 
+def parse_relay_bool(extra: Dict[str, Any], relay_key: str, fallback_key: str) -> bool:
+    """
+    Accepts relay values as:
+    - "1" / "0"
+    - 1 / 0
+    - True / False
+    - "true" / "false"
+    """
+    raw = extra.get(relay_key, extra.get(fallback_key, 0))
+
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return int(raw) == 1
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"1", "true", "on"}
+
+    return False
+
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "time": int(time.time())}
@@ -60,7 +81,14 @@ def post_telemetry(payload: TelemetryIn, authorization: Optional[str] = Header(N
     st = latest_state.get(payload.device_id, {})
     st["telemetry"] = payload.model_dump()
     st["last_seen"] = int(time.time())
-    st.setdefault("relays", {})
+
+    extra = payload.extra or {}
+    st["relays"] = {
+        "relay_1": parse_relay_bool(extra, "relay_1", "l1"),
+        "relay_2": parse_relay_bool(extra, "relay_2", "l2"),
+        "relay_3": parse_relay_bool(extra, "relay_3", "l3"),
+    }
+
     latest_state[payload.device_id] = st
     return {"ok": True}
 
@@ -68,14 +96,43 @@ def post_telemetry(payload: TelemetryIn, authorization: Optional[str] = Header(N
 @app.get("/api/state")
 def get_state(device_id: str, authorization: Optional[str] = Header(None)):
     require_bearer(authorization, APP_TOKEN)
-    return latest_state.get(device_id, {"device_id": device_id, "online": False})
+
+    st = latest_state.get(device_id)
+    if not st:
+        return {
+            "device_id": device_id,
+            "online": False,
+            "relays": {
+                "relay_1": False,
+                "relay_2": False,
+                "relay_3": False,
+            },
+        }
+
+    last_seen = st.get("last_seen", 0)
+    online = (int(time.time()) - last_seen) < 10
+
+    return {
+        "device_id": device_id,
+        "online": online,
+        **st,
+    }
 
 
 @app.post("/api/command")
 def post_command(cmd: CommandIn, authorization: Optional[str] = Header(None)):
     require_bearer(authorization, APP_TOKEN)
 
-    cmd_id = f"{int(time.time()*1000)}_{cmd.device_id}"
+    if cmd.command == "SET_RELAY":
+        relay = cmd.args.get("relay")
+        state = cmd.args.get("state")
+
+        if relay not in [1, 2, 3]:
+            raise HTTPException(status_code=400, detail="relay must be 1, 2, or 3")
+        if state not in [0, 1]:
+            raise HTTPException(status_code=400, detail="state must be 0 or 1")
+
+    cmd_id = f"{int(time.time() * 1000)}_{cmd.device_id}"
     entry = {
         "id": cmd_id,
         "command": cmd.command,
