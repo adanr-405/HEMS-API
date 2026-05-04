@@ -11,6 +11,8 @@ app = FastAPI(title="HEMS Cloud API")
 DEVICE_TOKEN = os.getenv("DEVICE_TOKEN", "dev_device_token_change_me")
 APP_TOKEN = os.getenv("APP_TOKEN", "dev_app_token_change_me")
 
+COMMAND_EXPIRATION_SECONDS = 30
+
 
 def require_bearer(auth_header: Optional[str], expected_token: str):
     if not auth_header or not auth_header.startswith("Bearer "):
@@ -35,21 +37,11 @@ class TelemetryIn(BaseModel):
 class CommandIn(BaseModel):
     device_id: str
 
-    # Supports older command format:
-    # {
-    #   "device_id": "...",
-    #   "command": "SET_RELAY",
-    #   "args": {"relay": 1, "state": 1}
-    # }
+    # Older backend/app format
     command: Optional[str] = "SET_RELAY"
     args: Dict[str, Any] = Field(default_factory=dict)
 
-    # Supports newer app format:
-    # {
-    #   "device_id": "...",
-    #   "relay": 1,
-    #   "state": true
-    # }
+    # Newer simple app format
     relay: Optional[int] = None
     state: Optional[Any] = None
 
@@ -134,6 +126,16 @@ def normalize_command(cmd: CommandIn) -> Dict[str, Any]:
     }
 
 
+def remove_expired_commands(device_id: str):
+    now = int(time.time())
+    q = pending_commands.get(device_id, [])
+
+    pending_commands[device_id] = [
+        cmd for cmd in q
+        if (now - cmd.get("ts", now)) <= COMMAND_EXPIRATION_SECONDS
+    ]
+
+
 @app.get("/healthz")
 def healthz():
     return {
@@ -199,8 +201,19 @@ def post_command(cmd: CommandIn, authorization: Optional[str] = Header(None)):
     relay = normalized["relay"]
     state = normalized["state"]
 
-    # Update remembered relay state immediately so the app reflects
-    # the requested state before the next Arduino telemetry post.
+    # Remove old commands before adding a new one
+    remove_expired_commands(cmd.device_id)
+
+    # Optional: remove older queued commands for the same relay
+    # This prevents old relay 1 ON followed later by relay 1 OFF from stacking.
+    q = pending_commands.get(cmd.device_id, [])
+    q = [
+        existing for existing in q
+        if existing.get("relay") != relay
+    ]
+    pending_commands[cmd.device_id] = q
+
+    # Update remembered relay state immediately so app reflects requested state
     st = latest_state.get(cmd.device_id, {})
     st.setdefault("relays", default_relays())
     st["relays"][f"relay_{relay}"] = state == 1
@@ -213,17 +226,12 @@ def post_command(cmd: CommandIn, authorization: Optional[str] = Header(None)):
     entry = {
         "id": cmd_id,
         "command": "SET_RELAY",
-
-        # These top-level values make Arduino parsing easier.
         "relay": relay,
         "state": state,
-
-        # Keep args for compatibility with older versions.
         "args": {
             "relay": relay,
             "state": state,
         },
-
         "ts": int(time.time()),
     }
 
@@ -240,12 +248,15 @@ def post_command(cmd: CommandIn, authorization: Optional[str] = Header(None)):
 def get_next_command(device_id: str, authorization: Optional[str] = Header(None)):
     require_bearer(authorization, DEVICE_TOKEN)
 
+    remove_expired_commands(device_id)
+
     q = pending_commands.get(device_id, [])
 
     if not q:
         return {"has_command": False}
 
     nxt = q.pop(0)
+    pending_commands[device_id] = q
 
     return {
         "has_command": True,
@@ -264,3 +275,16 @@ def post_ack(ack: CommandAckIn, authorization: Optional[str] = Header(None)):
     latest_state[ack.device_id] = st
 
     return {"ok": True}
+
+
+@app.post("/api/commands/clear")
+def clear_commands(device_id: str, authorization: Optional[str] = Header(None)):
+    require_bearer(authorization, APP_TOKEN)
+
+    pending_commands[device_id] = []
+
+    return {
+        "ok": True,
+        "device_id": device_id,
+        "cleared": True,
+    }
